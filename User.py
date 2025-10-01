@@ -1,112 +1,154 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 from pydantic import BaseModel, EmailStr, validator
-from typing import List
+from typing import List, Optional
 from security import hash_password
 from auth import auth_router
+from db import get_db
+from models import User
 
-app = FastAPI(title= "User Management API")
+app = FastAPI(title="User Management API")
 
+# 🔐 Register auth routes
 app.include_router(auth_router, prefix="/auth", tags=["authentication"])
 
-users_db = []
+from posts import router as posts_router
+app.include_router(posts_router) #uses prefix "/posts" from the router
 
+# -----------------------
+# Pydantic Schemas
+# -----------------------
 class UserIn(BaseModel):
-    username : str
+    username: str
     email: EmailStr
     password: str
-    full_name: str | None = None
+    full_name: Optional[str] = None
 
     @validator('password')
     def validate_password(cls, v):
         if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters')
-        
+            raise ValueError("Password must be at least 8 characters")
         return v
 
 class UserOut(BaseModel):
-    id : int
-    username : str
+    id: int
+    username: str
     email: EmailStr
-    full_name: str | None = None
+    full_name: Optional[str] = None
+
+    class Config:
+        orm_mode = True  # ✅ allows returning SQLAlchemy models directly
 
 
+# -----------------------
+# Health Check
+# -----------------------
 @app.get("/health")
-def health_check():
-    return {"status" : "healthy", "users_count" : len(users_db)}
+async def health_check(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User))
+    users = result.scalars().all()
+    return {"status": "healthy", "users_count": len(users)}
 
-#create user
-@app.post("/users", response_model = UserOut, status_code= 201)
-def create_user(user: UserIn):
-    for existing_user in users_db:
-        if existing_user["username"] == user.username:
-            raise HTTPException(status_code = 400, detail = "Username already exists")
-        
-    new_user = {
-        "id" : len(users_db) + 1,
-        "username" : user.username,
-        "email" : user.email,
-        "password_hash": hash_password(user.password),
-        "full_name" : user.full_name
-    }
 
-    users_db.append(new_user)
-    return {
-        "id" : new_user["id"],
-        "username" : new_user["username"],
-        "email" : new_user["email"],
-        "full_name" : new_user["full_name"]
-    }
+# -----------------------
+# Create User
+# -----------------------
+@app.post("/users", response_model=UserOut, status_code=201)
+async def create_user(user: UserIn, db: AsyncSession = Depends(get_db)):
+    # check unique username/email
+    result = await db.execute(select(User).where(User.username == user.username))
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Username already exists")
 
-#get all users
-@app.get("/users", response_model= List[UserOut])
-def get_users():
-    return users_db
+    result = await db.execute(select(User).where(User.email == user.email))
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Email already exists")
 
-#search users
+    new_user = User(
+        username=user.username,
+        email=user.email,
+        password_hash=hash_password(user.password),
+        full_name=user.full_name,
+    )
+
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    return new_user
+
+
+# -----------------------
+# Get All Users
+# -----------------------
+@app.get("/users", response_model=List[UserOut])
+async def get_users(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User))
+    return result.scalars().all()
+
+
+# -----------------------
+# Search Users
+# -----------------------
 @app.get("/users/search", response_model=List[UserOut])
-def search_users(username: str = None, email: str = None):
-    results = []
-    for user in users_db:
-        if (
-            (username is None or username.lower() in user["username"].lower())
-            and
-            (email is None or email.lower() in user["email"].lower())
-        ):
-            results.append(user)
-    return results
+async def search_users(
+    username: Optional[str] = None,
+    email: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    query = select(User)
+    if username:
+        query = query.where(User.username.ilike(f"%{username}%"))
+    if email:
+        query = query.where(User.email.ilike(f"%{email}%"))
 
-#specific user
-@app.get("/users/{user_id}", response_model = UserOut)
-def get_user(user_id: int):
-    for user in users_db:
-        if user["id"] == user_id:
-            return user
-        
-    raise HTTPException(status_code= 404, detail = "User not found")
+    result = await db.execute(query)
+    return result.scalars().all()
 
-#update user
-@app.put("/users/{user_id}", response_model = UserOut)
-def update_user(user_id: int, user_updates: UserIn):
-    for user in users_db:
-        if user["id"] == user_id:
-            user["username"] = user_updates.username
-            user["email"] = user_updates.email
-            user["full_name"] = user_updates.full_name
-            return user
-    raise HTTPException(status_code=404, detail="User does not exist")
 
-#delete user
+# -----------------------
+# Get Specific User
+# -----------------------
+@app.get("/users/{user_id}", response_model=UserOut)
+async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
+
+# -----------------------
+# Update User
+# -----------------------
+@app.put("/users/{user_id}", response_model=UserOut)
+async def update_user(user_id: int, user_updates: UserIn, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User does not exist")
+
+    user.username = user_updates.username
+    user.email = user_updates.email
+    user.full_name = user_updates.full_name
+    user.password_hash = hash_password(user_updates.password)
+
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+# -----------------------
+# Delete User
+# -----------------------
 @app.delete("/users/{user_id}")
-def delete_user(user_id: int):
-    for i, user in enumerate(users_db):
-        if user["id"] == user_id:
-            deleted_user = users_db.pop(i)
-            return {"message" : f"User {deleted_user['username']} deleted successfully"}
-        
-    raise HTTPException(status_code = 404, detail = "User not found")
+async def delete_user(user_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-
-@app.get("/debug/users")
-def debug_users():
-    return {"users_db": users_db}
+    await db.delete(user)
+    await db.commit()
+    return {"message": f"User {user.username} deleted successfully"}
